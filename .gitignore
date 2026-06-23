@@ -1,0 +1,27 @@
+# Dependencias
+node_modules/
+
+# Compilados y empaquetados
+dist/
+dist-electron/
+dist-electron.rar
+*.rar
+
+# Variables de entorno y logs
+.env
+.env.local
+.env.*.local
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Facturas PDF de prueba locales
+*.PDF
+*.pdf
+
+# Archivos del sistema y editores
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini

@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <title>Impresión de Etiquetas</title>
+  <style>
+    @page {
+      size: 55mm 40mm;
+      margin: 0;
+    }
+    body {
+      margin: 0;
+      padding: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background-color: white;
+      -webkit-print-color-adjust: exact;
+    }
+    .label-container {
+      width: 55mm;
+      height: 40mm;
+      box-sizing: border-box;
+      page-break-after: always;
+      display: flex;
+      flex-direction: column;
+      padding: 2mm 3mm; /* Ajustado para aprovechar el espacio de 55x40 */
+      position: relative;
+      overflow: hidden;
+    }
+    .label-container:last-child {
+      page-break-after: avoid; /* Evita página en blanco al final */
+    }
+    .header-bar {
+      background-color: #000;
+      color: #fff;
+      font-size: 7.2pt;
+      font-weight: 900;
+      text-align: center;
+      padding: 0.8mm 0;
+      border-radius: 3px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 1.5mm;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      line-height: 1;
+      white-space: nowrap;
+      text-overflow: ellipsis;
+      overflow: hidden;
+    }
+    .barcode-area {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      height: 13.5mm;
+      margin-bottom: 1mm;
+    }
+    .barcode-svg {
+      width: 100%;
+      height: 100%;
+    }
+    .product-code {
+      font-size: 9.5pt;
+      font-weight: 800;
+      text-align: center;
+      margin: 0 0 0.8mm 0;
+      line-height: 1;
+      white-space: nowrap;
+      text-overflow: ellipsis;
+      overflow: hidden;
+    }
+    .product-desc {
+      font-size: 6.5pt;
+      font-weight: 600;
+      line-height: 1.2;
+      text-align: center;
+      height: 8.5mm;
+      overflow: hidden;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      word-break: break-all;
+    }
+    .footer-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-end;
+      margin-top: auto;
+      height: 6mm;
+    }
+    .details-box {
+      font-size: 6.2pt;
+      font-weight: 600;
+      line-height: 1.3;
+      color: #333;
+    }
+    .detail-label {
+      font-weight: 800;
+      color: #000;
+    }
+    .detail-val {
+      font-weight: 600;
+    }
+    .cipher-badge {
+      background-color: #000;
+      color: #fff;
+      padding: 0.6mm 2mm;
+      font-size: 9.5pt;
+      font-weight: 900;
+      border-radius: 3px;
+      text-align: center;
+      line-height: 1;
+      letter-spacing: 0.3px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+  </style>
+</head>
+<body>
+  <div id="labels-root"></div>
+
+  <script>
+    const { ipcRenderer } = require('electron');
+    const JsBarcode = require('jsbarcode');
+
+    ipcRenderer.on('print-data', (event, labels) => {
+      const root = document.getElementById('labels-root');
+      root.innerHTML = ''; // Limpiar
+
+      labels.forEach((label, index) => {
+        // Estructura de cada etiqueta
+        const labelDiv = document.createElement('div');
+        labelDiv.className = 'label-container';
+
+        // Título de la tienda (Banda negra profesional invertida)
+        const title = document.createElement('div');
+        title.className = 'header-bar';
+        title.innerText = 'REPUESTOS SOTOMAYOR, C.A.';
+        labelDiv.appendChild(title);
+
+        // Área del código de barras
+        const barcodeArea = document.createElement('div');
+        barcodeArea.className = 'barcode-area';
+        const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+        svg.className = 'barcode-svg';
+        svg.id = `barcode-${index}`;
+        barcodeArea.appendChild(svg);
+        labelDiv.appendChild(barcodeArea);
+
+        // Código del repuesto (Grande y Destacado)
+        const codeDiv = document.createElement('div');
+        codeDiv.className = 'product-code';
+        codeDiv.innerText = label.code;
+        labelDiv.appendChild(codeDiv);
+
+        // Descripción del producto (Más pequeña)
+        const descDiv = document.createElement('div');
+        descDiv.className = 'product-desc';
+        descDiv.innerText = label.description;
+        labelDiv.appendChild(descDiv);
+
+        // Fila inferior
+        const footer = document.createElement('div');
+        footer.className = 'footer-row';
+
+        // Detalles (Proveedor y Fecha formateados)
+        const details = document.createElement('div');
+        details.className = 'details-box';
+        details.innerHTML = `<span class="detail-label">PROV:</span> <span class="detail-val">${label.providerCode || '00000'}</span><br><span class="detail-label">FECHA:</span> <span class="detail-val">${label.dateCode || '00/00'}</span>`;
+        footer.appendChild(details);
+
+        // Cifrado LUCHAREMOS
+        const cipher = document.createElement('div');
+        cipher.className = 'cipher-badge';
+        cipher.innerText = label.cipherCode;
+        footer.appendChild(cipher);
+
+        labelDiv.appendChild(footer);
+        root.appendChild(labelDiv);
+
+        // Generar el código de barras usando JsBarcode
+        try {
+          JsBarcode(`#barcode-${index}`, label.code, {
+            format: 'CODE128',
+            width: 1.35, // Ajustado para que quepa en 55mm
+            height: 45, // Altura en pixeles del código de barras
+            displayValue: false, // Ocultar el valor debajo de la barra para ahorrar espacio, ya que se lee abajo
+            margin: 0
+          });
+        } catch (err) {
+          console.error(`Error generando código de barras para ${label.code}:`, err);
+        }
+      });
+
+      // Avisar al proceso principal que estamos listos para imprimir
+      ipcRenderer.send('ready-to-print');
+    });
+  </script>
+</body>
+</html>
