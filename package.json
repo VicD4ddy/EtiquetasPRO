@@ -1,6 +1,6 @@
 {
   "name": "etiquetas-sotomayor",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Sistema de etiquetas para Repuestos Sotomayor",
   "main": "main.js",
   "scripts": {
@@ -8,7 +8,8 @@
     "build": "vite build",
     "start": "electron .",
     "electron:dev": "concurrently \"npm run dev\" \"wait-on http://localhost:5173 && electron .\"",
-    "dist": "npm run build && electron-builder"
+    "dist": "npm run build && electron-builder",
+    "test": "node --test tests/*.test.js"
   },
   "keywords": [
     "electron",
@@ -47,6 +48,13 @@
     "files": [
       "dist/**/*",
       "main.js",
+      "pdfParser.js",
+      "bcvService.js",
+      "historyStore.js",
+      "printSpooler.js",
+      "printPreload.js",
+      "providerStore.js",
+      "backupService.js",
       "preload.js",
       "print.html",
       "package.json"

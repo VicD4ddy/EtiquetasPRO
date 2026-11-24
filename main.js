@@ -1,7 +1,27 @@
-const { app, BrowserWindow, ipcMain } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog } = require('electron');
 const path = require('path');
 const fs = require('fs');
-const { PDFParse } = require('pdf-parse');
+const { parseInvoiceBuffer } = require('./pdfParser');
+const { fetchBcvUsdRate } = require('./bcvService');
+const {
+  getHistory,
+  addHistoryBatch,
+  deleteHistoryBatch,
+  clearHistory,
+  buildHistoryCsv
+} = require('./historyStore');
+const { runChunkedPrintJob } = require('./printSpooler');
+const {
+  getProvidersData,
+  saveProvider,
+  deleteProvider,
+  setRifAssociation,
+  migrateFromLocalStorage
+} = require('./providerStore');
+const {
+  exportBackupPayload,
+  importBackupPayload
+} = require('./backupService');
 
 let mainWindow;
 
@@ -52,202 +72,21 @@ app.on('window-all-closed', () => {
   }
 });
 
-// --- FUNCIONES UTILITARIAS PARA PARSEO DE PDF ---
-
-function parseSpanishFloat(val) {
-  if (!val) return 0;
-  return parseFloat(val.replace(/\./g, '').replace(',', '.'));
-}
-
-function formatSpanishFloat(val) {
-  return val.toFixed(2).replace('.', ',').replace(/\B(?=(\d{3})+(?!\d))/g, ".");
-}
-
-/**
- * Parsea una línea de texto de la factura buscando campos tabulares.
- */
-function parseLine(line) {
-  const floatRegex = /\d+(?:\.\d+)*,\d+/g;
-  const matches = [...line.matchAll(floatRegex)];
-  
-  if (matches.length < 8) {
-    return null;
-  }
-  
-  const itemMatches = matches.slice(-8);
-  const firstMatchIndex = itemMatches[0].index;
-  const headerPart = line.substring(0, firstMatchIndex).trim();
-  
-  const firstSpaceIndex = headerPart.search(/\s/);
-  let code = '';
-  let description = '';
-  if (firstSpaceIndex === -1) {
-    code = headerPart;
-  } else {
-    code = headerPart.substring(0, firstSpaceIndex).trim();
-    description = headerPart.substring(firstSpaceIndex).trim();
-  }
-  
-  description = description.replace(/^[\s\t\-,]+|[\s\t\-,]+$/g, '').trim();
-  
-  if (!code || code.toLowerCase().includes('total') || code.toLowerCase().includes('sub')) {
-    return null;
-  }
-  
-  let qtyOrd = itemMatches[0][0];
-  let qtyBonif = itemMatches[1][0];
-  const iva = itemMatches[2][0];
-  const total = itemMatches[3][0];
-  const dcto1 = itemMatches[4][0];
-  const subtotal = itemMatches[5][0];
-  const costoListaUnit = itemMatches[6][0];
-  const dcto2 = itemMatches[7][0];
-  
-  // Auto-corrección matemática de cantidades pegadas
-  const qtyOrdVal = parseSpanishFloat(qtyOrd);
-  const qtyBonifVal = parseSpanishFloat(qtyBonif);
-  const subtotalVal = parseSpanishFloat(subtotal);
-  const costoListaUnitVal = parseSpanishFloat(costoListaUnit);
-  
-  const expectedTotalUnits = Math.round(subtotalVal / costoListaUnitVal);
-  const actualTotalUnits = qtyOrdVal + qtyBonifVal;
-  
-  if (Math.abs(actualTotalUnits - expectedTotalUnits) > 0.01 && expectedTotalUnits > 0) {
-    const expectedQtyOrdVal = expectedTotalUnits - qtyBonifVal;
-    if (expectedQtyOrdVal > 0) {
-      const expectedQtyOrdStr = formatSpanishFloat(expectedQtyOrdVal);
-      if (qtyOrd.endsWith(expectedQtyOrdStr)) {
-        const prefix = qtyOrd.substring(0, qtyOrd.length - expectedQtyOrdStr.length);
-        if (prefix) {
-          description = `${description} ${prefix}`.trim();
-        }
-        qtyOrd = expectedQtyOrdStr;
-      }
-    }
-  }
-  
-  return {
-    code,
-    description,
-    qtyOrd,
-    qtyBonif,
-    iva,
-    total,
-    dcto1,
-    subtotal,
-    costoListaUnit,
-    dcto2
-  };
-}
-
-/**
- * Convierte un mes textual en español a su número de dos dígitos.
- */
-function parseSpanishMonth(monthStr) {
-  const months = {
-    ene: '01', feb: '02', mar: '03', abr: '04', may: '05', jun: '06',
-    jul: '07', ago: '08', sep: '09', oct: '10', nov: '11', dic: '12'
-  };
-  const normalized = monthStr.toLowerCase().replace(/[\.\s]/g, '').slice(0, 3);
-  return months[normalized] || '01';
-}
-
-/**
- * Extrae la fecha de emisión del PDF y la formatea como MM/YY.
- */
-function extractDateCode(text) {
-  // Buscar formatos del tipo 08/jun./2026 o 08/jun/2026
-  const textDateRegex = /\b(\d{2})\/([a-zA-Z\.\s]+)\/(\d{4})\b/;
-  const textMatch = text.match(textDateRegex);
-  if (textMatch) {
-    const month = parseSpanishMonth(textMatch[2]);
-    const yearShort = textMatch[3].slice(-2);
-    return `${month}/${yearShort}`;
-  }
-
-  // Buscar formato puramente numérico 04/06/2026
-  const numDateRegex = /\b(\d{2})\/(\d{2})\/(\d{4})\b/;
-  const numMatch = text.match(numDateRegex);
-  if (numMatch) {
-    const month = numMatch[2];
-    const yearShort = numMatch[3].slice(-2);
-    return `${month}/${yearShort}`;
-  }
-
-  // Retornar mes/año actual como fallback
-  const d = new Date();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  const y = String(d.getFullYear()).slice(-2);
-  return `${m}/${y}`;
-}
-
-/**
- * Extrae el número de factura o nota de entrega.
- */
-function extractInvoiceNum(text) {
-  // Buscar #77268 o #00112744
-  const hashMatch = text.match(/#(\d+)/);
-  if (hashMatch) {
-    return hashMatch[1];
-  }
-  // Buscar NOTA DE ENTREGA: 00002426
-  const entregaMatch = text.match(/NOTA\s+DE\s+ENTREGA:\s*(\d+)/i);
-  if (entregaMatch) {
-    return entregaMatch[1];
-  }
-  return 'S/N';
-}
-
-/**
- * Extrae el primer RIF del proveedor en el documento.
- */
-function extractProviderRif(text) {
-  // Ejemplo: J303261205 o J-30326120-5
-  const rifMatch = text.match(/\bJ-?\d{8}-?\d\b/i);
-  if (rifMatch) {
-    // Normalizar a mayúsculas y sin guiones
-    return rifMatch[0].toUpperCase().replace(/-/g, '');
-  }
-  return 'DESCONOCIDO';
-}
-
 // --- IPC HANDLERS ---
 
 // 1. Cargar y parsear PDF
 ipcMain.handle('parse-pdf', async (event, filePath) => {
-  let parser = null;
   try {
     if (!fs.existsSync(filePath)) {
       throw new Error('El archivo no existe en la ruta provista.');
     }
 
     const dataBuffer = fs.readFileSync(filePath);
-    parser = new PDFParse({ data: dataBuffer });
-    const data = await parser.getText();
-
-    const text = data.text;
-    const lines = text.split('\n');
-    const items = [];
-
-    for (const line of lines) {
-      const parsedItem = parseLine(line);
-      if (parsedItem) {
-        items.push(parsedItem);
-      }
-    }
-
-    const dateCode = extractDateCode(text);
-    const invoiceNum = extractInvoiceNum(text);
-    const providerRif = extractProviderRif(text);
+    const parsedData = await parseInvoiceBuffer(dataBuffer);
 
     return {
       success: true,
-      data: {
-        invoiceNum,
-        dateCode,
-        providerRif,
-        items
-      }
+      data: parsedData
     };
   } catch (err) {
     console.error('Error parseando PDF:', err);
@@ -255,14 +94,6 @@ ipcMain.handle('parse-pdf', async (event, filePath) => {
       success: false,
       error: err.message
     };
-  } finally {
-    if (parser) {
-      try {
-        await parser.destroy();
-      } catch (e) {
-        console.error('Error destruyendo parser:', e);
-      }
-    }
   }
 });
 
@@ -277,36 +108,58 @@ ipcMain.handle('get-printers', async () => {
   }
 });
 
-// 3. Imprimir etiquetas
-ipcMain.handle('print-labels', async (event, labels, printerName) => {
+// 3. Imprimir etiquetas en sub-lotes seguros (evita timeout y saturación de spooler >64 etiquetas)
+function printSingleChunk(chunkLabels, printerName, chunkIndex) {
   return new Promise((resolve) => {
     let printWindow = null;
     let hasFinished = false;
+    let renderTimer = null;
+    let spoolTimer = null;
+    const jobId = `print-${Date.now()}-${chunkIndex}-${Math.random().toString(36).slice(2, 7)}`;
 
-    // Crear ventana invisible
-    printWindow = new BrowserWindow({
-      show: false,
-      webPreferences: {
-        nodeIntegration: true,
-        contextIsolation: false,
+    const cleanup = () => {
+      if (renderTimer) {
+        clearTimeout(renderTimer);
+        renderTimer = null;
       }
-    });
+      if (spoolTimer) {
+        clearTimeout(spoolTimer);
+        spoolTimer = null;
+      }
+      ipcMain.removeListener('ready-to-print', onReady);
+      if (printWindow && !printWindow.isDestroyed()) {
+        printWindow.destroy();
+      }
+      printWindow = null;
+    };
 
-    printWindow.loadFile(path.join(__dirname, 'print.html'));
-
-    printWindow.webContents.on('did-finish-load', () => {
-      // Mandar las etiquetas a la ventana de impresión
-      printWindow.webContents.send('print-data', labels);
-    });
-
-    // Manejador temporal una sola vez para realizar la impresión cuando la ventana esté lista
-    ipcMain.once('ready-to-print', async () => {
+    const finish = (result) => {
       if (hasFinished) return;
+      hasFinished = true;
+      cleanup();
+      resolve(result);
+    };
+
+    const onReady = (event, receivedJobId) => {
+      if (hasFinished) return;
+      if (!printWindow || printWindow.isDestroyed()) return;
+      if (event.sender !== printWindow.webContents) return;
+      if (receivedJobId && receivedJobId !== jobId) return;
+
+      if (renderTimer) {
+        clearTimeout(renderTimer);
+        renderTimer = null;
+      }
+
+      spoolTimer = setTimeout(() => {
+        finish({ success: false, error: 'Tiempo de espera agotado al enviar el bloque a la impresora.' });
+      }, 60000);
+
       try {
         const printOptions = {
           silent: true,
           margins: { marginType: 'none' },
-          pageSize: { width: 55000, height: 40000 } // 55mm x 40mm en micrones (55,000 x 40,000)
+          pageSize: { width: 55000, height: 40000 } // 55mm x 40mm en micrones
         };
 
         if (printerName && printerName !== 'Default') {
@@ -314,38 +167,287 @@ ipcMain.handle('print-labels', async (event, labels, printerName) => {
         }
 
         printWindow.webContents.print(printOptions, (success, failureReason) => {
-          hasFinished = true;
-          if (printWindow) {
-            printWindow.destroy();
-            printWindow = null;
-          }
-
           if (success) {
-            resolve({ success: true });
+            finish({ success: true });
           } else {
-            resolve({ success: false, error: failureReason || 'Error desconocido en driver de impresión.' });
+            finish({ success: false, error: failureReason || 'Error desconocido en driver de impresión.' });
           }
         });
       } catch (err) {
-        hasFinished = true;
-        if (printWindow) {
-          printWindow.destroy();
-          printWindow = null;
-        }
-        resolve({ success: false, error: err.message });
+        finish({ success: false, error: err.message });
+      }
+    };
+
+    printWindow = new BrowserWindow({
+      show: false,
+      webPreferences: {
+        preload: path.join(__dirname, 'printPreload.js'),
+        contextIsolation: true,
+        nodeIntegration: false,
+        sandbox: false,
+        backgroundThrottling: false
       }
     });
 
-    // Timeout de seguridad por si algo falla al cargar print.html o renderizar
-    setTimeout(() => {
-      if (!hasFinished) {
-        hasFinished = true;
-        if (printWindow) {
-          printWindow.destroy();
-          printWindow = null;
-        }
-        resolve({ success: false, error: 'Tiempo de espera agotado al renderizar la plantilla de impresión.' });
+    ipcMain.on('ready-to-print', onReady);
+
+    printWindow.webContents.on('did-fail-load', (e, errorCode, errorDesc) => {
+      finish({ success: false, error: `Error cargando plantilla de impresión: ${errorDesc || errorCode}` });
+    });
+
+    printWindow.webContents.on('render-process-gone', () => {
+      finish({ success: false, error: 'El proceso de renderizado de impresión se cerró inesperadamente.' });
+    });
+
+    renderTimer = setTimeout(() => {
+      finish({ success: false, error: 'Tiempo de espera agotado al renderizar la plantilla de impresión.' });
+    }, 15000);
+
+    printWindow.loadFile(path.join(__dirname, 'print.html'));
+
+    printWindow.webContents.once('did-finish-load', () => {
+      if (!hasFinished && printWindow && !printWindow.isDestroyed()) {
+        printWindow.webContents.send('print-data', { jobId, labels: chunkLabels });
       }
-    }, 10000);
+    });
   });
+}
+
+ipcMain.handle('print-labels', async (event, labels, printerName) => {
+  return await runChunkedPrintJob({
+    labels,
+    printerName,
+    printSingleChunk,
+    onProgress: (progress) => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('print-progress', progress);
+      }
+    }
+  });
+});
+
+// Diálogo nativo para seleccionar PDF
+ipcMain.handle('select-pdf-dialog', async () => {
+  try {
+    const { canceled, filePaths } = await dialog.showOpenDialog(mainWindow, {
+      title: 'Seleccionar Factura PDF',
+      properties: ['openFile'],
+      filters: [{ name: 'Documentos PDF', extensions: ['pdf'] }]
+    });
+    if (canceled || !filePaths || filePaths.length === 0) {
+      return { canceled: true };
+    }
+    const filePath = filePaths[0];
+    return {
+      canceled: false,
+      filePath,
+      fileName: path.basename(filePath)
+    };
+  } catch (err) {
+    console.error('Error abriendo selector de PDF:', err);
+    return { canceled: true, error: err.message };
+  }
+});
+
+// 4. Consultar Tasa BCV (USD) con caché offline
+ipcMain.handle('fetch-bcv-rate', async () => {
+  try {
+    const storageDir = app.getPath('userData');
+    return await fetchBcvUsdRate({ storageDir });
+  } catch (err) {
+    console.error('Error consultando tasa BCV:', err);
+    return {
+      success: false,
+      error: err.message
+    };
+  }
+});
+
+// 5. Historial de impresiones (retención 6 meses)
+ipcMain.handle('get-history', async () => {
+  try {
+    const storageDir = app.getPath('userData');
+    return {
+      success: true,
+      data: getHistory(storageDir)
+    };
+  } catch (err) {
+    console.error('Error leyendo historial:', err);
+    return {
+      success: false,
+      error: err.message,
+      data: []
+    };
+  }
+});
+
+ipcMain.handle('add-history-batch', async (event, batchInput) => {
+  try {
+    const storageDir = app.getPath('userData');
+    const result = addHistoryBatch(storageDir, batchInput);
+    return {
+      success: true,
+      data: result
+    };
+  } catch (err) {
+    console.error('Error guardando lote en historial:', err);
+    return {
+      success: false,
+      error: err.message
+    };
+  }
+});
+
+ipcMain.handle('delete-history-batch', async (event, batchId) => {
+  try {
+    const storageDir = app.getPath('userData');
+    const updated = deleteHistoryBatch(storageDir, batchId);
+    return {
+      success: true,
+      data: updated
+    };
+  } catch (err) {
+    console.error('Error eliminando lote del historial:', err);
+    return {
+      success: false,
+      error: err.message
+    };
+  }
+});
+
+ipcMain.handle('clear-history', async () => {
+  try {
+    const storageDir = app.getPath('userData');
+    const cleared = clearHistory(storageDir);
+    return {
+      success: true,
+      data: cleared
+    };
+  } catch (err) {
+    console.error('Error limpiando historial:', err);
+    return {
+      success: false,
+      error: err.message
+    };
+  }
+});
+
+ipcMain.handle('export-history-csv', async (event, batches) => {
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    const { canceled, filePath } = await dialog.showSaveDialog(mainWindow, {
+      title: 'Exportar Historial de Etiquetas a CSV',
+      defaultPath: path.join(app.getPath('documents'), `Historial_Etiquetas_${today}.csv`),
+      filters: [{ name: 'CSV (delimitado por comas)', extensions: ['csv'] }]
+    });
+
+    if (canceled || !filePath) {
+      return { success: false, canceled: true };
+    }
+
+    const csvContent = buildHistoryCsv(batches || []);
+    fs.writeFileSync(filePath, csvContent, 'utf8');
+    return { success: true, filePath };
+  } catch (err) {
+    console.error('Error exportando historial CSV:', err);
+    return { success: false, error: err.message };
+  }
+});
+
+// 6. Proveedores persistentes en userData
+ipcMain.handle('get-providers', async () => {
+  try {
+    const storageDir = app.getPath('userData');
+    return { success: true, data: getProvidersData(storageDir) };
+  } catch (err) {
+    console.error('Error leyendo proveedores:', err);
+    return { success: false, error: err.message, data: { providers: [], rifMap: {} } };
+  }
+});
+
+ipcMain.handle('save-provider', async (event, providerInput) => {
+  try {
+    const storageDir = app.getPath('userData');
+    return { success: true, data: saveProvider(storageDir, providerInput) };
+  } catch (err) {
+    console.error('Error guardando proveedor:', err);
+    return { success: false, error: err.message };
+  }
+});
+
+ipcMain.handle('delete-provider', async (event, providerId) => {
+  try {
+    const storageDir = app.getPath('userData');
+    return { success: true, data: deleteProvider(storageDir, providerId) };
+  } catch (err) {
+    console.error('Error eliminando proveedor:', err);
+    return { success: false, error: err.message };
+  }
+});
+
+ipcMain.handle('set-rif-association', async (event, rif, code) => {
+  try {
+    const storageDir = app.getPath('userData');
+    return { success: true, data: setRifAssociation(storageDir, rif, code) };
+  } catch (err) {
+    console.error('Error guardando asociación RIF:', err);
+    return { success: false, error: err.message };
+  }
+});
+
+ipcMain.handle('migrate-providers', async (event, legacyPayload) => {
+  try {
+    const storageDir = app.getPath('userData');
+    return { success: true, data: migrateFromLocalStorage(storageDir, legacyPayload) };
+  } catch (err) {
+    console.error('Error migrando proveedores:', err);
+    return { success: false, error: err.message };
+  }
+});
+
+// 7. Respaldo y restauración en JSON
+ipcMain.handle('export-backup', async () => {
+  try {
+    const storageDir = app.getPath('userData');
+    const today = new Date().toISOString().slice(0, 10);
+    const { canceled, filePath } = await dialog.showSaveDialog(mainWindow, {
+      title: 'Exportar Respaldo Completo (Proveedores e Historial)',
+      defaultPath: path.join(app.getPath('documents'), `Respaldo_EtiquetasPRO_${today}.json`),
+      filters: [{ name: 'Respaldo JSON', extensions: ['json'] }]
+    });
+
+    if (canceled || !filePath) {
+      return { success: false, canceled: true };
+    }
+
+    const payload = exportBackupPayload(storageDir);
+    fs.writeFileSync(filePath, JSON.stringify(payload, null, 2), 'utf8');
+    return { success: true, filePath };
+  } catch (err) {
+    console.error('Error exportando respaldo:', err);
+    return { success: false, error: err.message };
+  }
+});
+
+ipcMain.handle('import-backup', async (event, mode = 'merge') => {
+  try {
+    const storageDir = app.getPath('userData');
+    const { canceled, filePaths } = await dialog.showOpenDialog(mainWindow, {
+      title: 'Importar Respaldo JSON',
+      properties: ['openFile'],
+      filters: [{ name: 'Respaldo JSON', extensions: ['json'] }]
+    });
+
+    if (canceled || !filePaths || filePaths.length === 0) {
+      return { success: false, canceled: true };
+    }
+
+    const raw = fs.readFileSync(filePaths[0], 'utf8');
+    const parsed = JSON.parse(raw);
+    const data = importBackupPayload(storageDir, parsed, mode);
+    return { success: true, data };
+  } catch (err) {
+    console.error('Error importando respaldo:', err);
+    return { success: false, error: err.message };
+  }
 });
