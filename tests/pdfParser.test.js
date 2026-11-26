@@ -5,7 +5,8 @@ const {
   parseLineFallback,
   extractDateCode,
   extractInvoiceNum,
-  extractProviderRif
+  extractProviderRif,
+  parseLocaleFloat
 } = require('../pdfParser');
 
 function escapePdfText(str) {
@@ -220,4 +221,71 @@ test('Metadatos y fallback textual parseLineFallback', () => {
   assert.equal(singleSpaceParsed.code, 'ABC123');
   assert.equal(singleSpaceParsed.description, 'FILTRO ACEITE');
   assert.equal(singleSpaceParsed.needsReview, true);
+});
+
+test('Valery ERP real layout: formato 82,417.23 / 2.00, encabezado Nombre/Ord/Costo Lista y providerName', async () => {
+  const entries = [
+    { x: 27.8, y: 740, text: 'Proveedor:' },
+    { x: 99.8, y: 740, text: 'J075159110' },
+    { x: 160, y: 740, text: 'REPUESTOS VENEZUELA S R L' },
+    { x: 476.8, y: 711.3, text: '#5965' },
+    { x: 512.3, y: 688.3, text: '23/nov./2026' },
+    // Encabezado real Valery
+    { x: 18, y: 599.7, text: 'Código' },
+    { x: 101.3, y: 599.7, text: 'Nombre' },
+    { x: 228.7, y: 599.7, text: 'Ord.' },
+    { x: 260, y: 599.7, text: 'Bonif.' },
+    { x: 294, y: 599.7, text: 'Costo Lista' },
+    { x: 345.1, y: 599.7, text: '% Dcto 1' },
+    { x: 380.7, y: 599.7, text: '% Dcto 2' },
+    { x: 426.9, y: 599.7, text: 'Sub Total' },
+    { x: 481.6, y: 599.7, text: 'Impuesto' },
+    { x: 542.7, y: 599.7, text: 'Total' },
+    // Fila 1: código con espacio interno + monto inglés con miles y punto decimal
+    { x: 18, y: 582.8, text: 'FS-7733-SB2-SS FRAC' },
+    { x: 100.5, y: 582.8, text: 'KIT EMPACADURA MALIBU 305 350' },
+    { x: 237.6, y: 582.8, text: '2.00' },
+    { x: 272.1, y: 582.8, text: '0.00' },
+    { x: 307, y: 582.8, text: '82,417.23' },
+    { x: 362.8, y: 582.8, text: '10.00' },
+    { x: 398.8, y: 582.8, text: '0.00' },
+    { x: 434.4, y: 582.8, text: '148,351.01' },
+    { x: 485.5, y: 582.8, text: '23,736.16' },
+    { x: 540.9, y: 582.8, text: '172,087.17' },
+    // Fila 2: descripción con número 5.3 y código largo solapado en xEnd
+    { x: 18, y: 571.5, text: '8972553130-CHICAGO' },
+    { x: 100.5, y: 571.5, text: 'BOMBA FRENO SILVERADO 5.3' },
+    { x: 237.6, y: 571.5, text: '4.00' },
+    { x: 272.1, y: 571.5, text: '0.00' },
+    { x: 307, y: 571.5, text: '44,052.96' },
+    { x: 362.8, y: 571.5, text: '0.00' },
+    { x: 398.8, y: 571.5, text: '0.00' },
+    { x: 434.4, y: 571.5, text: '176,211.84' },
+    { x: 485.5, y: 571.5, text: '28,193.89' },
+    { x: 540.9, y: 571.5, text: '204,405.73' }
+  ];
+
+  const result = await parseInvoiceBuffer(buildSyntheticPdf(entries));
+  assert.equal(result.invoiceNum, '5965');
+  assert.equal(result.dateCode, '11/26');
+  assert.equal(result.providerRif, 'J075159110');
+  assert.equal(result.providerName, 'REPUESTOS VENEZUELA S R L');
+  assert.equal(result.items.length, 2);
+
+  assert.equal(result.items[0].code, 'FS-7733-SB2-SS FRAC');
+  assert.equal(result.items[0].description, 'KIT EMPACADURA MALIBU 305 350');
+  assert.equal(result.items[0].qtyOrd, '2.00');
+  assert.equal(result.items[0].costoListaUnit, '82,417.23');
+  assert.equal(result.items[0].needsReview, false);
+
+  assert.equal(result.items[1].code, '8972553130-CHICAGO');
+  assert.equal(result.items[1].description, 'BOMBA FRENO SILVERADO 5.3');
+  assert.equal(result.items[1].qtyOrd, '4.00');
+  assert.equal(result.items[1].costoListaUnit, '44,052.96');
+  assert.equal(result.items[1].needsReview, false);
+
+  assert.equal(parseLocaleFloat('82,417.23'), 82417.23);
+  assert.equal(parseLocaleFloat('2.00'), 2);
+  assert.equal(parseLocaleFloat('82.417,23'), 82417.23);
+  assert.equal(parseLocaleFloat('4,00'), 4);
 });

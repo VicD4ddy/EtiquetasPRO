@@ -52,23 +52,52 @@ export function encodeLUCHAREMOS(costUSD) {
 }
 
 /**
+ * Parsea un valor numérico en formato Valery (82,417.23 / 2.00) o español (82.417,23 / 2,00).
+ * @param {string|number} val - Valor a convertir.
+ * @returns {number}
+ */
+export function parseLocaleFloat(val) {
+  if (typeof val === 'number') {
+    return Number.isFinite(val) ? val : 0;
+  }
+  if (!val || typeof val !== 'string') return 0;
+
+  const cleaned = val.trim().replace(/\s+/g, '');
+  if (!cleaned) return 0;
+
+  const lastComma = cleaned.lastIndexOf(',');
+  const lastDot = cleaned.lastIndexOf('.');
+
+  let normalized = cleaned;
+  if (lastComma !== -1 && lastDot !== -1) {
+    normalized = lastDot > lastComma
+      ? cleaned.replace(/,/g, '')
+      : cleaned.replace(/\./g, '').replace(',', '.');
+  } else if (lastComma !== -1) {
+    normalized = /,\d{1,2}$/.test(cleaned)
+      ? cleaned.replace(',', '.')
+      : cleaned.replace(/,/g, '');
+  } else if (lastDot !== -1) {
+    normalized = /\.\d{1,2}$/.test(cleaned)
+      ? cleaned
+      : cleaned.replace(/\./g, '');
+  }
+
+  const num = parseFloat(normalized);
+  return Number.isFinite(num) ? num : 0;
+}
+
+/**
  * Parsea un precio de lista en bolívares y calcula el costo en USD basándose en la tasa BCV.
- * @param {string|number} priceBsStr - Precio en Bs (con separador español).
+ * @param {string|number} priceBsStr - Precio en Bs (formato Valery o español).
  * @param {number} tasaBCV - Tasa de cambio BCV.
  * @returns {number} Costo en USD.
  */
 export function calculateCostUSD(priceBsStr, tasaBCV) {
   if (!tasaBCV || tasaBCV <= 0) return 0;
-  
-  let priceBs = 0;
-  if (typeof priceBsStr === 'number') {
-    priceBs = priceBsStr;
-  } else if (typeof priceBsStr === 'string') {
-    // Limpiar separador de miles '.' y reemplazar coma decimal ',' por '.'
-    priceBs = parseFloat(priceBsStr.replace(/\./g, '').replace(',', '.'));
-  }
-  
+
+  const priceBs = parseLocaleFloat(priceBsStr);
   if (isNaN(priceBs) || priceBs <= 0) return 0;
-  
+
   return priceBs / tasaBCV;
 }

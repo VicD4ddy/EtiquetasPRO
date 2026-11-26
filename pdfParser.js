@@ -1,16 +1,79 @@
 const { PDFParse } = require('pdf-parse');
 
-const FLOAT_REGEX = /\d+(?:\.\d+)*,\d+/g;
+const MONEY_FLOAT_REGEX = /(?<!\d)(?:\d{1,3}(?:,\d{3})+\.\d{2}|\d{1,3}(?:\.\d{3})+,\d{2}|\d+[.,]\d{2})(?!\d)/g;
 const HEADER_CODE_REGEX = /^(COD\.?|CODIGO|COD\.?\s*ART\.?|COD\.?\s*PROD\.?|ITEM|ARTICULO)$/;
-const HEADER_DESC_REGEX = /^(DESCRIPCION|DESC\.?|DETALLE|CONCEPTO|PRODUCTO)$/;
+const HEADER_DESC_REGEX = /^(DESCRIPCION|DESC\.?|NOMBRE|DETALLE|CONCEPTO|PRODUCTO)$/;
+
+const HEADER_NUMERIC_MATCHERS = [
+  { key: 'qtyOrd', regex: /^(ORD\.?|CANT\.?|CANTIDAD)$/ },
+  { key: 'qtyBonif', regex: /^(BONIF\.?|BONIFICACION)$/ },
+  { key: 'costoListaUnit', regex: /^(COSTO\s*LISTA|COSTO|PRECIO(\s*UNIT\.?)?)$/ },
+  { key: 'dcto1', regex: /^%?\s*DCTO\.?\s*1$/ },
+  { key: 'dcto2', regex: /^%?\s*DCTO\.?\s*2$/ },
+  { key: 'subtotal', regex: /^(SUB\s*TOTAL|SUBTOTAL)$/ },
+  { key: 'iva', regex: /^(IMPUESTO|IVA|I\.?V\.?A\.?)$/ },
+  { key: 'total', regex: /^TOTAL$/ }
+];
+
+const VALERY_NUMERIC_ORDER = ['qtyOrd', 'qtyBonif', 'costoListaUnit', 'dcto1', 'dcto2', 'subtotal', 'iva', 'total'];
+const LEGACY_NUMERIC_ORDER = ['qtyOrd', 'qtyBonif', 'iva', 'total', 'dcto1', 'subtotal', 'costoListaUnit', 'dcto2'];
+
+function parseLocaleFloat(val) {
+  if (typeof val === 'number') {
+    return Number.isFinite(val) ? val : 0;
+  }
+  if (!val || typeof val !== 'string') return 0;
+
+  const cleaned = val.trim().replace(/\s+/g, '');
+  if (!cleaned) return 0;
+
+  const lastComma = cleaned.lastIndexOf(',');
+  const lastDot = cleaned.lastIndexOf('.');
+
+  let normalized = cleaned;
+  if (lastComma !== -1 && lastDot !== -1) {
+    if (lastDot > lastComma) {
+      // Formato inglés / Valery: 82,417.23
+      normalized = cleaned.replace(/,/g, '');
+    } else {
+      // Formato español: 82.417,23
+      normalized = cleaned.replace(/\./g, '').replace(',', '.');
+    }
+  } else if (lastComma !== -1) {
+    if (/,\d{1,2}$/.test(cleaned)) {
+      normalized = cleaned.replace(',', '.');
+    } else {
+      normalized = cleaned.replace(/,/g, '');
+    }
+  } else if (lastDot !== -1) {
+    if (/\.\d{1,2}$/.test(cleaned)) {
+      normalized = cleaned;
+    } else {
+      normalized = cleaned.replace(/\./g, '');
+    }
+  }
+
+  const num = parseFloat(normalized);
+  return Number.isFinite(num) ? num : 0;
+}
 
 function parseSpanishFloat(val) {
-  if (!val) return 0;
-  return parseFloat(val.replace(/\./g, '').replace(',', '.'));
+  return parseLocaleFloat(val);
 }
 
 function formatSpanishFloat(val) {
   return val.toFixed(2).replace('.', ',').replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+}
+
+function formatEnglishFloat(val) {
+  return val.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+}
+
+function formatFloatMatchingStyle(val, sampleStr) {
+  if (typeof sampleStr === 'string' && /\.\d{2}$/.test(sampleStr.trim())) {
+    return formatEnglishFloat(val);
+  }
+  return formatSpanishFloat(val);
 }
 
 function normalizeLabel(text) {
@@ -74,6 +137,37 @@ function extractProviderRif(text) {
   return 'DESCONOCIDO';
 }
 
+function extractProviderNameFromText(text) {
+  if (!text) return '';
+  const match = text.match(/Proveedor:\s*(?:J-?\d{8}-?\d[\s\t]+)?([^\n\t]+)/i);
+  if (match && match[1]) {
+    return match[1].replace(/^J-?\d{8}-?\d\s*/i, '').trim();
+  }
+  return '';
+}
+
+function extractProviderName(allRows, fullText) {
+  if (Array.isArray(allRows)) {
+    for (const row of allRows) {
+      const provIdx = row.atoms.findIndex((a) => /^PROVEEDOR:?$/i.test(normalizeLabel(a.str) + ':') || normalizeLabel(a.str) === 'PROVEEDOR');
+      if (provIdx !== -1) {
+        const provAtom = row.atoms[provIdx];
+        const rightAtoms = row.atoms
+          .slice(provIdx + 1)
+          .filter((a) => a.x > provAtom.x)
+          .filter((a) => !/^J-?\d{8}-?\d$/i.test(a.str.trim()));
+        if (rightAtoms.length > 0) {
+          const joined = joinAtomsForSingleColumn(rightAtoms)
+            .replace(/^J-?\d{8}-?\d\s*/i, '')
+            .trim();
+          if (joined) return joined;
+        }
+      }
+    }
+  }
+  return extractProviderNameFromText(fullText);
+}
+
 function cleanDescription(text) {
   return (text || '').replace(/^[\s\t\-,]+|[\s\t\-,]+$/g, '').trim();
 }
@@ -90,7 +184,6 @@ function joinAtomsText(atoms, useTabs = false) {
     } else if (gap >= 0.8) {
       out += ' ' + curr.str;
     } else {
-      // Si los fragmentos están pegados (0pt o kerning), conservar espacio solo si alguno lo sugiere o si son bloques separados
       out += (gap >= 0 ? ' ' : '') + curr.str;
     }
   }
@@ -113,29 +206,73 @@ function joinAtomsForSingleColumn(atoms) {
   return out.trim();
 }
 
-function applyMathQtyCorrection(code, description, itemMatches) {
-  let qtyOrd = itemMatches[0][0];
-  const qtyBonif = itemMatches[1][0];
-  const iva = itemMatches[2][0];
-  const total = itemMatches[3][0];
-  const dcto1 = itemMatches[4][0];
-  const subtotal = itemMatches[5][0];
-  const costoListaUnit = itemMatches[6][0];
-  const dcto2 = itemMatches[7][0];
+function mapNumericColumns(itemMatches, numericOrder) {
+  let order = numericOrder;
+  if (!Array.isArray(order) || order.length !== 8) {
+    // Inferir orden entre formato Valery moderno y formato heredado V1.0 verificando Cantidad * CostoLista ≈ SubTotal
+    const vals = itemMatches.map((m) => parseLocaleFloat(m[0]));
+    const qtyStr = itemMatches[0][0];
+    const qty = vals[0] + vals[1];
+    const sub = vals[5];
+    const val2Diff = sub > 0 ? Math.abs(qty * vals[2] - sub) / sub : 1;
+    const val6Diff = sub > 0 ? Math.abs(qty * vals[6] - sub) / sub : 1;
 
-  const qtyOrdVal = parseSpanishFloat(qtyOrd);
-  const qtyBonifVal = parseSpanishFloat(qtyBonif);
-  const subtotalVal = parseSpanishFloat(subtotal);
-  const costoListaUnitVal = parseSpanishFloat(costoListaUnit);
+    if (qty > 0 && sub > 0 && val6Diff < 0.05 && val2Diff >= 0.05) {
+      order = LEGACY_NUMERIC_ORDER;
+    } else if (sub > 0 && vals[6] > 0 && val2Diff >= 0.05) {
+      // Comprobar si la cantidad esperada (subtotal / costoLista - bonif) es entero y sufijo de qtyOrd pegado
+      const expLegacy = Math.round(sub / vals[6]) - vals[1];
+      const expValery = vals[2] > 0 ? Math.round(sub / vals[2]) - vals[1] : 0;
+      const legacyMatchesSuffix =
+        expLegacy > 0 &&
+        Math.abs(Math.round(sub / vals[6]) - sub / vals[6]) < 0.02 &&
+        qtyStr.endsWith(formatFloatMatchingStyle(expLegacy, qtyStr));
+      const valeryMatchesSuffix =
+        expValery > 0 &&
+        Math.abs(Math.round(sub / vals[2]) - sub / vals[2]) < 0.02 &&
+        qtyStr.endsWith(formatFloatMatchingStyle(expValery, qtyStr));
 
-  if (costoListaUnitVal > 0) {
+      if (legacyMatchesSuffix && !valeryMatchesSuffix) {
+        order = LEGACY_NUMERIC_ORDER;
+      } else {
+        order = VALERY_NUMERIC_ORDER;
+      }
+    } else {
+      order = VALERY_NUMERIC_ORDER;
+    }
+  }
+
+  const mapped = {};
+  for (let i = 0; i < 8; i++) {
+    mapped[order[i]] = itemMatches[i][0];
+  }
+  return mapped;
+}
+
+function applyMathQtyCorrection(code, description, itemMatches, numericOrder = null) {
+  const fields = mapNumericColumns(itemMatches, numericOrder);
+  let qtyOrd = fields.qtyOrd;
+  const qtyBonif = fields.qtyBonif;
+  const iva = fields.iva;
+  const total = fields.total;
+  const dcto1 = fields.dcto1;
+  const subtotal = fields.subtotal;
+  const costoListaUnit = fields.costoListaUnit;
+  const dcto2 = fields.dcto2;
+
+  const qtyOrdVal = parseLocaleFloat(qtyOrd);
+  const qtyBonifVal = parseLocaleFloat(qtyBonif);
+  const subtotalVal = parseLocaleFloat(subtotal);
+  const costoListaUnitVal = parseLocaleFloat(costoListaUnit);
+
+  if (costoListaUnitVal > 0 && subtotalVal > 0) {
     const expectedTotalUnits = Math.round(subtotalVal / costoListaUnitVal);
     const actualTotalUnits = qtyOrdVal + qtyBonifVal;
 
     if (Math.abs(actualTotalUnits - expectedTotalUnits) > 0.01 && expectedTotalUnits > 0) {
       const expectedQtyOrdVal = expectedTotalUnits - qtyBonifVal;
       if (expectedQtyOrdVal > 0) {
-        const expectedQtyOrdStr = formatSpanishFloat(expectedQtyOrdVal);
+        const expectedQtyOrdStr = formatFloatMatchingStyle(expectedQtyOrdVal, qtyOrd);
         if (qtyOrd.endsWith(expectedQtyOrdStr)) {
           const prefix = qtyOrd.substring(0, qtyOrd.length - expectedQtyOrdStr.length);
           if (prefix) {
@@ -209,7 +346,7 @@ function splitHeaderTextFallback(headerPart) {
 }
 
 function parseLineFallback(line) {
-  const matches = [...line.matchAll(FLOAT_REGEX)];
+  const matches = [...line.matchAll(MONEY_FLOAT_REGEX)];
   if (matches.length < 8) {
     return null;
   }
@@ -226,7 +363,7 @@ function parseLineFallback(line) {
     return null;
   }
 
-  const base = applyMathQtyCorrection(code, description, itemMatches);
+  const base = applyMathQtyCorrection(code, description, itemMatches, null);
   const evaluation = evaluateRowReview(base.code, base.description, split.usedFallback, split.reason);
 
   return {
@@ -313,7 +450,7 @@ function extractCandidateRow(row) {
     spans.push({ atomIndex: i, start, end, atom });
   }
 
-  const matches = [...rowText.matchAll(FLOAT_REGEX)];
+  const matches = [...rowText.matchAll(MONEY_FLOAT_REGEX)];
   if (matches.length < 8) {
     return null;
   }
@@ -374,9 +511,26 @@ function detectHeaderRow(rows) {
       }
     }
     if (codeAtom && descAtom) {
+      const numericCols = [];
+      const seenKeys = new Set();
+      for (const atom of row.atoms) {
+        if (atom.x <= descAtom.x) continue;
+        const norm = normalizeLabel(atom.str);
+        for (const matcher of HEADER_NUMERIC_MATCHERS) {
+          if (!seenKeys.has(matcher.key) && matcher.regex.test(norm)) {
+            seenKeys.add(matcher.key);
+            numericCols.push({ key: matcher.key, x: atom.x });
+            break;
+          }
+        }
+      }
+      numericCols.sort((a, b) => a.x - b.x);
+      const numericOrder = numericCols.length === 8 ? numericCols.map((c) => c.key) : null;
+
       return {
         codeX: Number(codeAtom.x.toFixed(1)),
         descX: Number(descAtom.x.toFixed(1)),
+        numericOrder,
         rawHeaderText: row.atoms.map((a) => a.str).join(' | ')
       };
     }
@@ -435,7 +589,6 @@ function detectColumnLayout(allRows, candidateRows) {
   const strongClusters = clusters.filter((c) => c.count >= minSupport);
 
   if (strongClusters.length > 0) {
-    // Elegir el clúster más a la izquierda con soporte sólido (los demás a la derecha suelen ser segundas palabras/segmentos de la descripción)
     strongClusters.sort((a, b) => a.center - b.center);
     const chosen = strongClusters[0];
     const descColX = Number(chosen.center.toFixed(1));
@@ -475,7 +628,6 @@ function detectColumnLayout(allRows, candidateRows) {
     }
   }
 
-  // Fallback por mayor hueco horizontal entre átomos de prefijo
   const gapMidpoints = [];
   for (const row of candidateRows) {
     if (row.prefixAtoms.length >= 2) {
@@ -548,7 +700,6 @@ function splitMergedAtomAtX(atom, splitX) {
   const ratio = Math.min(0.9, Math.max(0.1, (splitX - atom.x) / width));
   const approxIdx = Math.round(ratio * text.length);
 
-  // 1. Buscar espacio cercano dentro de ±4 caracteres
   let bestSpaceIdx = -1;
   let bestSpaceDist = Infinity;
   for (let i = Math.max(1, approxIdx - 4); i <= Math.min(text.length - 2, approxIdx + 4); i++) {
@@ -568,7 +719,6 @@ function splitMergedAtomAtX(atom, splitX) {
     };
   }
 
-  // 2. Buscar transición de dígito/símbolo a palabra alfabética larga (>= 4 letras) cerca de approxIdx
   const transitionRegex = /(?<=[0-9\-_/.])([A-ZÁÉÍÓÚÑ]{4,})/g;
   let bestTransIdx = -1;
   let bestTransDist = Infinity;
@@ -588,7 +738,6 @@ function splitMergedAtomAtX(atom, splitX) {
     };
   }
 
-  // 3. Corte proporcional directo como último recurso
   const safeIdx = Math.max(1, Math.min(text.length - 1, approxIdx));
   return {
     code: text.slice(0, safeIdx).trim(),
@@ -673,6 +822,7 @@ async function extractWithPdfJsCoordinates(dataBuffer) {
     }
 
     const { detectedHeader, detectedColumns } = detectColumnLayout(allRows, candidateRows);
+    const numericOrder = detectedHeader && detectedHeader.numericOrder ? detectedHeader.numericOrder : null;
 
     const items = [];
     const sampleRows = [];
@@ -684,7 +834,12 @@ async function extractWithPdfJsCoordinates(dataBuffer) {
         continue;
       }
 
-      const base = applyMathQtyCorrection(splitResult.code, splitResult.description, candidate.itemMatches);
+      const base = applyMathQtyCorrection(
+        splitResult.code,
+        splitResult.description,
+        candidate.itemMatches,
+        numericOrder
+      );
       const review = evaluateRowReview(
         base.code,
         base.description,
@@ -725,6 +880,7 @@ async function extractWithPdfJsCoordinates(dataBuffer) {
       invoiceNum: extractInvoiceNum(fullText),
       dateCode: extractDateCode(fullText),
       providerRif: extractProviderRif(fullText),
+      providerName: extractProviderName(allRows, fullText),
       items,
       diagnostic: {
         parserMode: 'pdfjs-coordinates',
@@ -775,6 +931,7 @@ async function extractWithFallbackText(dataBuffer, causeError) {
       invoiceNum: extractInvoiceNum(text),
       dateCode: extractDateCode(text),
       providerRif: extractProviderRif(text),
+      providerName: extractProviderNameFromText(text),
       items,
       diagnostic: {
         parserMode: 'fallback-text',
@@ -813,6 +970,8 @@ module.exports = {
   extractDateCode,
   extractInvoiceNum,
   extractProviderRif,
+  extractProviderName,
+  parseLocaleFloat,
   parseSpanishFloat,
   formatSpanishFloat
 };

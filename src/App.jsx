@@ -6,7 +6,7 @@ import HistoryView from './components/HistoryView';
 import ManualLabelView from './components/ManualLabelView';
 import ProvidersModal from './components/ProvidersModal';
 import BackupModal from './components/BackupModal';
-import { calculateCostUSD, encodeLUCHAREMOS } from './utils/encoder';
+import { calculateCostUSD, encodeLUCHAREMOS, parseLocaleFloat } from './utils/encoder';
 
 function normalizeRif(rif) {
   return String(rif || '').toUpperCase().replace(/[^A-Z0-9]/g, '').trim();
@@ -246,8 +246,8 @@ export default function App() {
       const initialQuantities = {};
       const normalizedItems = (data.items || []).map((item, idx) => {
         const id = item.id ?? `item-${idx}`;
-        const qtyOrdVal = Math.round(parseFloat(item.qtyOrd.replace(/\./g, '').replace(',', '.'))) || 0;
-        const qtyBonifVal = Math.round(parseFloat(item.qtyBonif.replace(/\./g, '').replace(',', '.'))) || 0;
+        const qtyOrdVal = Math.round(parseLocaleFloat(item.qtyOrd)) || 0;
+        const qtyBonifVal = Math.round(parseLocaleFloat(item.qtyBonif)) || 0;
         const totalUnits = qtyOrdVal + qtyBonifVal;
 
         const descLower = (item.description || '').toLowerCase();
@@ -1074,6 +1074,7 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => {
+                  setNewProvName(invoiceData && invoiceData.providerName ? invoiceData.providerName : '');
                   setNewProvCode(providerCode);
                   setQuickProvError('');
                   setIsRegisterProviderOpen(true);
